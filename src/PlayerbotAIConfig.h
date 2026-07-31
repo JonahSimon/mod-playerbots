@@ -107,6 +107,23 @@ public:
     bool botAutologin;
     std::string randomBotMapsAsString;
     float probTeleToBankers;
+    // Populate-Around-Players (F1) — concentrate level-appropriate bots into real-player zones
+    bool populateAroundPlayers;
+    float populateProbTeleport;
+    uint32 populateDensityDefault;
+    uint32 populatePeerBand;
+    float populatePeerFraction;
+    float populateSoloFactionRatio;
+    float populateMinorityFloor;
+    std::map<uint32, uint32> populateDensityOverrides;
+    std::vector<uint32> populateStarterZones;
+    std::vector<uint32> populateSanctuaryZones;
+    bool populateSoftenEnemyPvp;
+    float populateSoftenReactMult;
+    // F2 — Overland travel parties (bots march city -> dungeon entrance, then disband)
+    bool travelParties;
+    bool travelPartyTestMode;
+    uint32 travelPartyDungeonSize;
     bool enableWeightTeleToCityBankers;
     int weightTeleToStormwind;
     int weightTeleToIronforge;

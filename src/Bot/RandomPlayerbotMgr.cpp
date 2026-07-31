@@ -9,10 +9,13 @@
 
 #include <algorithm>
 #include <boost/thread/thread.hpp>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <random>
+#include <sstream>
 
 #include "AiFactory.h"
 #include "Battleground.h"
@@ -24,6 +27,7 @@
 #include "Define.h"
 #include "FleeManager.h"
 #include "GridNotifiers.h"
+#include "GroupMgr.h"
 #include "LFGMgr.h"
 #include "MapMgr.h"
 #include "NewRpgInfo.h"
@@ -41,6 +45,7 @@
 #include "RandomPlayerbotFactory.h"
 #include "ServerFacade.h"
 #include "SharedDefines.h"
+#include "PathGenerator.h"
 #include "TravelMgr.h"
 #include "Unit.h"
 #include "World.h"
@@ -287,6 +292,33 @@ void RandomPlayerbotMgr::UpdateAIInternal(uint32 /*elapsed*/, bool /*minimal*/)
 
     if (!sPlayerbotAIConfig.randomBotAutologin || !sPlayerbotAIConfig.enabled)
         return;
+
+    // Populate-Around-Players (F1): refresh the real-player zone demand map every 30s.
+    if (sPlayerbotAIConfig.populateAroundPlayers)
+    {
+        uint32 now = (uint32)time(nullptr);
+        if (now - _playerZoneRefreshTime >= 30)
+        {
+            _playerZoneRefreshTime = now;
+            RefreshPlayerZones();
+        }
+    }
+
+    // Overland travel parties (F2): drive active parties; auto-fire in test mode.
+    if (sPlayerbotAIConfig.travelParties)
+    {
+        UpdateTravelParties();
+        if (sPlayerbotAIConfig.travelPartyTestMode)
+        {
+            uint32 now = (uint32)time(nullptr);
+            // ponytail: fixed 60s test cadence; add a config key if it ever needs tuning.
+            if (now - _travelPartyTime >= 60)
+            {
+                _travelPartyTime = now;
+                SpawnTravelParty();
+            }
+        }
+    }
 
     /*if (sPlayerbotAIConfig.enablePrototypePerformanceDiff)
     {
@@ -1595,6 +1627,10 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation>&
     if (bot->GetGroup() && !bot->GetGroup()->IsLeader(bot->GetGUID()))
         return;
 
+    // F2: don't yank a bot that's marching in a travel party (leader included).
+    if (sPlayerbotAIConfig.travelParties && IsInTravelParty(bot))
+        return;
+
     PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
     if (botAI)
     {
@@ -1763,10 +1799,769 @@ void RandomPlayerbotMgr::Init()
     PlayerbotsDatabase.Execute("DELETE FROM playerbots_random_bots WHERE event = 'add'");
 }
 
+void RandomPlayerbotMgr::RefreshPlayerZones()
+{
+    _playerZones.clear();
+
+    // 1. Seed zones from online real players.
+    for (Player* player : players)
+    {
+        if (!player || !player->IsInWorld())
+            continue;
+
+        uint32 zoneId = player->GetZoneId();
+        ZoneDemand& d = _playerZones[zoneId];
+        d.zoneId = zoneId;
+
+        uint32 level = player->GetLevel();
+        if (player->GetTeamId() == TEAM_ALLIANCE)
+            d.playersAlliance++;
+        else
+            d.playersHorde++;
+
+        d.minPlayerLevel = d.minPlayerLevel ? std::min(d.minPlayerLevel, level) : level;
+        d.maxPlayerLevel = std::max(d.maxPlayerLevel, level);
+    }
+
+    if (_playerZones.empty())
+        return;
+
+    // 2. Density target + faction share per zone (territory-driven).
+    for (auto& itr : _playerZones)
+    {
+        ZoneDemand& d = itr.second;
+
+        auto ov = sPlayerbotAIConfig.populateDensityOverrides.find(d.zoneId);
+        d.target = (ov != sPlayerbotAIConfig.populateDensityOverrides.end())
+                       ? ov->second
+                       : sPlayerbotAIConfig.populateDensityDefault;
+
+        AreaTableEntry const* zone = sAreaTableStore.LookupEntry(d.zoneId);
+        uint32 team = zone ? zone->team : 0;  // 2 = Alliance, 4 = Horde, else contested
+        bool sanctuary = std::find(sPlayerbotAIConfig.populateSanctuaryZones.begin(),
+                                   sPlayerbotAIConfig.populateSanctuaryZones.end(), d.zoneId) !=
+                         sPlayerbotAIConfig.populateSanctuaryZones.end();
+        bool starter = std::find(sPlayerbotAIConfig.populateStarterZones.begin(),
+                                 sPlayerbotAIConfig.populateStarterZones.end(), d.zoneId) !=
+                       sPlayerbotAIConfig.populateStarterZones.end();
+
+        bool aPlayers = d.playersAlliance > 0;
+        bool hPlayers = d.playersHorde > 0;
+        float aShare;
+
+        if (sanctuary || starter)
+        {
+            // Friendly-only by owning faction; never pull the enemy here.
+            if (team == 2)
+                aShare = 1.0f;
+            else if (team == 4)
+                aShare = 0.0f;
+            else
+                aShare = (aPlayers && !hPlayers) ? 1.0f : ((hPlayers && !aPlayers) ? 0.0f : 0.5f);
+        }
+        else
+        {
+            if (aPlayers && !hPlayers)
+                aShare = sPlayerbotAIConfig.populateSoloFactionRatio;
+            else if (hPlayers && !aPlayers)
+                aShare = 1.0f - sPlayerbotAIConfig.populateSoloFactionRatio;
+            else if (aPlayers && hPlayers)
+                aShare = (float)d.playersAlliance / (float)(d.playersAlliance + d.playersHorde);
+            else
+                aShare = 0.5f;
+
+            bool enemyPresent = aPlayers && hPlayers;
+            if (!enemyPresent)
+            {
+                // Own-territory bias: mostly the owning faction + a small invader minority.
+                if (team == 2)
+                    aShare = std::max(aShare, 0.85f);
+                else if (team == 4)
+                    aShare = std::min(aShare, 0.15f);
+            }
+            else
+            {
+                // Opposing players present -> clamp toward the floor (emergent battles).
+                float f = sPlayerbotAIConfig.populateMinorityFloor;
+                aShare = std::max(f, std::min(1.0f - f, aShare));
+            }
+        }
+
+        d.allianceShare = aShare;
+        d.allowAlliance = aShare > 0.001f;
+        d.allowHorde = aShare < 0.999f;
+    }
+
+    // 3. Count current bots per zone / faction / band.
+    PlayerBotMap const& bots = GetAllBots();
+    for (auto const& itr : bots)
+    {
+        Player* bot = itr.second;
+        if (!bot || !bot->IsInWorld())
+            continue;
+
+        auto zi = _playerZones.find(bot->GetZoneId());
+        if (zi == _playerZones.end())
+            continue;
+
+        ZoneDemand& d = zi->second;
+        if (bot->GetTeamId() == TEAM_ALLIANCE)
+            d.curAlliance++;
+        else
+            d.curHorde++;
+
+        if (IsPopulatePeer(d, bot->GetLevel()))
+            d.curPeer++;
+        else
+            d.curTexture++;
+    }
+}
+
+bool RandomPlayerbotMgr::IsPopulatePeer(ZoneDemand const& d, uint32 level) const
+{
+    uint32 band = sPlayerbotAIConfig.populatePeerBand;
+    uint32 lo = d.minPlayerLevel > band ? d.minPlayerLevel - band : 1;
+    uint32 hi = d.maxPlayerLevel + band;
+    return level >= lo && level <= hi;
+}
+
+std::vector<WorldLocation> RandomPlayerbotMgr::GetPlayerZoneTeleportLocations(Player* bot)
+{
+    std::vector<WorldLocation> out;
+    if (!bot || _playerZones.empty())
+        return out;
+
+    std::vector<WorldLocation> locs = sTravelMgr.GetTeleportLocations(bot);
+    if (locs.empty())
+        return out;
+
+    TeamId team = bot->GetTeamId();
+    uint32 level = bot->GetLevel();
+
+    for (WorldLocation& loc : locs)
+    {
+        Map* map = sMapMgr->FindMap(loc.GetMapId(), 0);
+        if (!map)
+            continue;
+
+        uint32 zoneId = map->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ());
+        auto zi = _playerZones.find(zoneId);
+        if (zi == _playerZones.end())
+            continue;
+
+        ZoneDemand const& d = zi->second;
+
+        // Faction gate.
+        if (team == TEAM_ALLIANCE && !d.allowAlliance)
+            continue;
+        if (team == TEAM_HORDE && !d.allowHorde)
+            continue;
+
+        float share = (team == TEAM_ALLIANCE) ? d.allianceShare : (1.0f - d.allianceShare);
+        uint32 factionTarget = (uint32)(d.target * share + 0.5f);
+        uint32 factionCur = (team == TEAM_ALLIANCE) ? d.curAlliance : d.curHorde;
+        if (factionCur >= factionTarget)
+            continue;
+
+        // Band gate (peer vs zone-texture).
+        uint32 peerTarget = (uint32)(d.target * sPlayerbotAIConfig.populatePeerFraction + 0.5f);
+        uint32 texTarget = d.target > peerTarget ? d.target - peerTarget : 0;
+        bool peer = IsPopulatePeer(d, level);
+        if (peer && d.curPeer >= peerTarget)
+            continue;
+        if (!peer && d.curTexture >= texTarget)
+            continue;
+
+        out.push_back(loc);
+    }
+
+    return out;
+}
+
+// ============================================================================
+// F2 — Overland travel parties (Phase 1: Orgrimmar -> Wailing Caverns, on foot)
+// ============================================================================
+
+// Telemetry to a plain file, bypassing the AC logging framework entirely (the "playerbots"
+// logger's output never reaches the Manager's captured stdout). ponytail: debug instrument;
+// drop once the walk is validated.
+static void F2Log(std::string const& line)
+{
+    std::ofstream f("C:/Build/bin/RelWithDebInfo/Logs/F2_travel.log", std::ios::app);
+    if (f)
+    {
+        f << "[" << (uint32)time(nullptr) << "] " << line << "\n";
+    }
+}
+
+bool RandomPlayerbotMgr::IsInTravelParty(Player* bot)
+{
+    if (_travelParties.empty() || !bot)
+        return false;
+
+    ObjectGuid guid = bot->GetGUID();
+    for (TravelParty const& p : _travelParties)
+        for (ObjectGuid const& m : p.memberGuids)
+            if (m == guid)
+                return true;
+    return false;
+}
+
+std::string RandomPlayerbotMgr::SpawnTravelParty()
+{
+    if (!sPlayerbotAIConfig.travelParties)
+        return "";
+
+    // ponytail: single concurrent party for Phase 1; lift the cap when the walk is proven.
+    if (!_travelParties.empty())
+        return "";
+
+    // Phase 1 hardcoded route — Orgrimmar muster -> Wailing Caverns entrance (both map 1).
+    // Refine these by watching where the party actually ends up in-game.
+    uint32 const mapId = 1;
+    // Muster in OPEN Durotar just outside the Orgrimmar gate (wildlife roams here -> guaranteed on
+    // the navmesh). The old Valley-of-Strength spot was INSIDE the city off the navmesh poly, so
+    // PathGenerator returned NOPATH for ~17s and the leader nudged straight through city walls.
+    float const musterX = 1260.f, musterY = -4279.f, musterZ = 25.f;
+    // Target the outdoor CAVE MOUTH and disband there = "reached the entrance". The swirly portal is
+    // deep inside the cave (-753.6,-2212.78,21.54); TESTED 2026-07-21: the tunnel mouth->portal is NOT
+    // on map 1's navmesh -- pathing toward the portal climbs the surface hill ABOVE it (Z80->130) and
+    // the nearest reachable poly stays ~90 yd out, so bots can't walk in. Stop at the mouth (bots
+    // don't enter/clear anyway). Walking deeper would need scripted floor waypoints (no mesh there).
+    float const mouthX = -844.0f, mouthY = -2037.0f, mouthZ = 80.5f;
+    float const destX = mouthX, destY = mouthY, destZ = mouthZ;
+
+    uint32 const want = std::min<uint32>(sPlayerbotAIConfig.travelPartyDungeonSize, 5);
+
+    // Gather eligible Horde random bots that aren't busy. We teleport them to the muster
+    // point regardless of where they are, so the party always starts together at the city.
+    std::vector<Player*> picked;
+    for (auto const& itr : GetAllBots())
+    {
+        if (picked.size() >= want)
+            break;
+
+        Player* bot = itr.second;
+        if (!bot || !bot->IsInWorld() || !bot->IsAlive())
+            continue;
+        if (!IsRandomBot(bot))
+            continue;
+        if (bot->GetTeamId() != TEAM_HORDE)
+            continue;
+        if (bot->GetLevel() > 30)  // Wailing Caverns is a low-level dungeon
+            continue;
+        if (bot->GetGroup() || bot->IsInCombat())
+            continue;
+        if (bot->InBattleground() || bot->InBattlegroundQueue() || bot->InArena())
+            continue;
+        if (!GET_PLAYERBOT_AI(bot))
+            continue;
+
+        picked.push_back(bot);
+    }
+
+    if (picked.size() < 2)
+    {
+        LOG_ERROR("playerbots", "F2: not enough eligible bots for a travel party ({} found)", picked.size());
+        return "";
+    }
+
+    Player* leader = picked.front();
+    PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader);
+
+    Group* group = new Group();
+    if (!group->Create(leader))
+    {
+        delete group;
+        return "";
+    }
+    sGroupMgr->AddGroup(group);
+
+    leader->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TELEPORTED | AURA_INTERRUPT_FLAG_CHANGE_MAP);
+    leader->TeleportTo(mapId, musterX, musterY, musterZ, 0);
+
+    TravelParty party;
+    party.leaderGuid = leader->GetGUID();
+    party.memberGuids.push_back(leader->GetGUID());
+    party.mapId = mapId;
+    party.destX = destX;
+    party.destY = destY;
+    party.destZ = destZ;
+    party.route.push_back(WorldLocation(mapId, mouthX, mouthY, mouthZ));  // single stage: the mouth
+    party.routeIdx = 0;
+
+    for (size_t i = 1; i < picked.size(); ++i)
+    {
+        Player* member = picked[i];
+        if (group->GetMembersCount() >= 5)
+            break;
+        if (!group->AddMember(member))
+            continue;
+
+        PlayerbotAI* memberAI = GET_PLAYERBOT_AI(member);
+        if (!memberAI)
+            continue;
+
+        member->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TELEPORTED | AURA_INTERRUPT_FLAG_CHANGE_MAP);
+        member->TeleportTo(mapId, musterX + frand(-4.f, 4.f), musterY + frand(-4.f, 4.f), musterZ, 0);
+
+        // Follow the bot leader (same pattern as PlayerbotAI's master-follow path). Strip the
+        // autonomous strategies so members march with the group instead of wandering/flying off.
+        memberAI->SetMaster(leader);
+        memberAI->ResetStrategies();
+        memberAI->ChangeStrategy("+follow,-new rpg,-grind,-rpg", BOT_STATE_NON_COMBAT);
+
+        party.memberGuids.push_back(member->GetGUID());
+    }
+
+    // Drive the leader via a self-owned, forced TravelDestination. We never register it with
+    // TravelMgr (so nothing else touches it) and free it on disband — the visitor counter is
+    // just an int, so there is no shared-ownership hazard. forced=true keeps the target active
+    // (no auto-expire, no "choose travel target" overwrite) until the leader reaches the radius.
+    WorldPosition* destPos = new WorldPosition(mapId, mouthX, mouthY, mouthZ, 0.f);
+    TravelDestination* dest = new TravelDestination(15.0f, 60.0f);  // radiusMin = arrival radius
+    dest->addPoint(destPos);
+    party.dest = dest;
+    party.destPos = destPos;
+
+    // Strip the autonomous drivers: "new rpg" (relevance 11) flies to far destinations and would
+    // override travel; "grind"/"rpg" wander. Leave only "travel" so the leader WALKS via navmesh.
+    leaderAI->ChangeStrategy("+travel,-new rpg,-grind,-rpg", BOT_STATE_NON_COMBAT);
+    TravelTarget* target = leaderAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
+    target->setTarget(dest, destPos);
+    target->setForced(true);  // MUST follow setTarget (it clears forced)
+
+    party.deadline = (uint32)time(nullptr) + 900;  // 15 min hard timeout
+    party.bestProgressTime = (uint32)time(nullptr);  // start the descend plateau clock now
+
+    // Route is computed live in the tick via PathGenerator (the navmesh), so no precompute here.
+    // (The TravelNode graph / getFullPath is unusable for us: it feeds a null bot to the path
+    // builder, which returns empty -- that was the routeWaypoints=0. The navmesh itself works.)
+    _travelParties.push_back(std::move(party));
+
+    LOG_ERROR("playerbots", "F2: travel party formed ({} bots), marching Orgrimmar -> Wailing Caverns",
+             (uint32)_travelParties.back().memberGuids.size());
+    {
+        std::ostringstream o;
+        o << "FORMED " << _travelParties.back().memberGuids.size() << " bots; leader " << leader->GetName()
+          << " muster (" << (int)musterX << "," << (int)musterY << "," << (int)musterZ << ") -> WC ("
+          << (int)destX << "," << (int)destY << "," << (int)destZ << ")";
+        F2Log(o.str());
+    }
+    return leader->GetName();
+}
+
+void RandomPlayerbotMgr::UpdateTravelParties()
+{
+    if (_travelParties.empty())
+        return;
+
+    uint32 now = (uint32)time(nullptr);
+
+    for (auto it = _travelParties.begin(); it != _travelParties.end();)
+    {
+        TravelParty& p = *it;
+        Player* leader = ObjectAccessor::FindConnectedPlayer(p.leaderGuid);
+
+        bool done = false;
+        if (!leader || !leader->IsInWorld() || !leader->IsAlive())
+        {
+            done = true;  // leader gone -> tear down
+        }
+        else if (now >= p.deadline)
+        {
+            LOG_ERROR("playerbots", "F2: travel party timed out; disbanding.");
+            done = true;
+        }
+        else if (leader->GetMapId() == p.mapId &&
+                 leader->GetExactDist(p.destX, p.destY, p.destZ) <= 18.0f)
+        {
+            // Arrived at the current stage target. If more waypoints remain (mouth -> portal), advance
+            // to the next and keep marching; otherwise this is the final arrival -> disband. Reset the
+            // per-stage progress/descend state so the next leg starts fresh.
+            if (p.routeIdx + 1 < p.route.size())
+            {
+                p.routeIdx++;
+                WorldLocation const& w = p.route[p.routeIdx];
+                p.destX = w.GetPositionX();
+                p.destY = w.GetPositionY();
+                p.destZ = w.GetPositionZ();
+                p.bestDoorDist = 1e9f;
+                p.bestProgressTime = now;
+                p.descending = false;
+                p.curTgtSet = false;
+                std::ostringstream o;
+                o << "STAGE advance -> waypoint " << p.routeIdx << " (" << (int)p.destX << ","
+                  << (int)p.destY << "," << (int)p.destZ << ")";
+                F2Log(o.str());
+                LOG_ERROR("playerbots", "F2: reached WC mouth; heading into the cave to the portal.");
+            }
+            else
+            {
+                LOG_ERROR("playerbots", "F2: travel party reached the WC cave mouth; disbanding.");
+                F2Log("ARRIVED at cave mouth (3D<=18) -> disband");
+                done = true;
+            }
+        }
+        else if (PlayerbotAI* lAI = GET_PLAYERBOT_AI(leader))
+        {
+            TravelTarget* tt = lAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
+
+            // Keep the leader locked to WALKING. Random-bot management can re-add the autonomous
+            // strategies ("new rpg" flies to far destinations at relevance 11, overriding travel),
+            // so re-strip them and keep our forced walk target alive every tick.
+            if (!leader->IsBeingTeleported())
+            {
+                if (lAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ||
+                    lAI->HasStrategy("grind", BOT_STATE_NON_COMBAT) ||
+                    !lAI->HasStrategy("travel", BOT_STATE_NON_COMBAT))
+                    lAI->ChangeStrategy("+travel,-new rpg,-grind,-rpg", BOT_STATE_NON_COMBAT);
+
+                if (!tt->isForced() || !tt->isTraveling())
+                {
+                    tt->setTarget(p.dest, p.destPos);
+                    tt->setForced(true);
+                }
+
+                float const lx = leader->GetPositionX();
+                float const ly = leader->GetPositionY();
+                float const lz = leader->GetPositionZ();
+
+                // --- Descend-to-door: detect the ravine-rim plateau and switch to a straight descent. ---
+                // During the overland march doorDist3d drops steadily; on the rim it oscillates but
+                // stops improving. When it plateaus while near the entrance, head straight for the door.
+                float const doorDist3d = leader->GetExactDist(p.destX, p.destY, p.destZ);
+                if (doorDist3d < p.bestDoorDist - 2.0f)
+                {
+                    p.bestDoorDist = doorDist3d;
+                    p.bestProgressTime = now;
+                }
+                bool const nearEntrance = leader->GetExactDist2d(p.destX, p.destY) <= 120.0f;
+                if (!p.descending && nearEntrance && (now - p.bestProgressTime) >= 25)
+                {
+                    p.descending = true;
+                    F2Log("DESCEND mode: rim plateau near WC entrance, heading straight for the door");
+                }
+                // Graceful fallback: if even the descent stops improving, we're as close as the
+                // navmesh allows -> disband "close enough" rather than loop forever.
+                if (p.descending && (now - p.bestProgressTime) >= 30)
+                {
+                    F2Log("DESCEND stalled -> disband close-enough");
+                    done = true;
+                }
+
+                // Keep the crew together. The +follow strategy alone leaves members stuck ~45 yd
+                // back (city geometry, or they revert to autonomous behaviour), which deadlocks the
+                // leader's wait. So ACTIVELY drive each follower toward the leader with short navmesh
+                // hops, re-lock their follow strategy, and snap back anyone truly lost.
+                float maxMemberDist = 0.f;
+                for (ObjectGuid const& mg : p.memberGuids)
+                {
+                    if (mg == p.leaderGuid)
+                        continue;
+                    Player* member = ObjectAccessor::FindConnectedPlayer(mg);
+                    if (!member || !member->IsInWorld())
+                        continue;
+
+                    if (PlayerbotAI* mAI = GET_PLAYERBOT_AI(member))
+                    {
+                        if (mAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT) ||
+                            mAI->HasStrategy("grind", BOT_STATE_NON_COMBAT) ||
+                            !mAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+                        {
+                            mAI->SetMaster(leader);
+                            mAI->ChangeStrategy("+follow,-new rpg,-grind,-rpg", BOT_STATE_NON_COMBAT);
+                        }
+                    }
+
+                    float md = (member->GetMapId() == leader->GetMapId())
+                                   ? member->GetExactDist(lx, ly, lz)
+                                   : 100000.f;
+                    if (md > 55.f)
+                    {
+                        // Fell too far behind (or off-map) -> snap into formation next to the leader.
+                        // Since the leader no longer stops to wait, this is what keeps the group tight;
+                        // with mount states stable it fires rarely (only real terrain snags).
+                        member->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TELEPORTED |
+                                                              AURA_INTERRUPT_FLAG_CHANGE_MAP);
+                        member->NearTeleportTo(lx + frand(-4.f, 4.f), ly + frand(-4.f, 4.f), lz,
+                                               member->GetOrientation());
+                        md = 4.f;
+                    }
+                    else if (md > 12.f && !member->isMoving() && !member->IsBeingTeleported())
+                    {
+                        // Actively walk toward the leader (short hop = navmesh follows ground).
+                        member->GetMotionMaster()->MovePoint(990002, lx + frand(-5.f, 5.f),
+                                                             ly + frand(-5.f, 5.f), lz,
+                                                             FORCED_MOVEMENT_NONE, 0.f, 0.f, true, false);
+                    }
+                    maxMemberDist = std::max(maxMemberDist, md);
+                }
+
+                p.maxMemberDist = maxMemberDist;
+
+                // --- Leader movement: ONE long continuous navmesh spline toward the entrance. ---
+                // Smoothness rule: re-path and re-issue MovePoint only when we're near the current
+                // target or actually stopped -- re-issuing every tick restarts the spline and is what
+                // made it run/stop/run. Cohesion: keep moving unless the group is badly strung out
+                // (wide 60 yd threshold), and clear the target on a hard stop so we re-path on resume.
+                if (p.descending)
+                {
+                    // Walk DOWN to the door along the real navmesh -- never forceDestination (that
+                    // straight-lines through terrain and clips the bot into the ground/on top of the
+                    // entrance collision). The old plain-navmesh probes aimed horizontally at RIM height
+                    // (lz), so they circled the rim. Instead probe a ring AROUND the door at the door's
+                    // low Z and take the navmesh-reachable point whose reachable endpoint is CLOSEST to
+                    // the door: that endpoint is a step down the ramp/spiral. Repeat -> chunk-walk down.
+                    // If nothing near the door is reachable (mmap gap at the pit), the fallback disbands
+                    // cleanly at the rim rather than clipping.
+                    if (!leader->isMoving() || !p.curTgtSet ||
+                        leader->GetExactDist2d(p.curTgtX, p.curTgtY) <= 6.f)
+                    {
+                        float bestD = 1e9f, bx = 0.f, by = 0.f, bz = 0.f;
+                        bool found = false;
+                        auto consider = [&](float tx, float ty, float tz)
+                        {
+                            PathGenerator g(leader);
+                            g.CalculatePath(tx, ty, tz);
+                            PathType pt = g.GetPathType();
+                            if ((pt & (PATHFIND_NORMAL | PATHFIND_INCOMPLETE)) == 0 ||
+                                (pt & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH)) != 0 ||
+                                g.GetPath().empty())
+                                return;
+                            G3D::Vector3 const e = g.GetPath().back();
+                            float const dd = std::sqrt((e.x - p.destX) * (e.x - p.destX) +
+                                                       (e.y - p.destY) * (e.y - p.destY) +
+                                                       (e.z - p.destZ) * (e.z - p.destZ));
+                            if (dd < bestD) { bestD = dd; bx = e.x; by = e.y; bz = e.z; found = true; }
+                        };
+                        consider(p.destX, p.destY, p.destZ);  // the door itself
+                        float const radii[] = {8.f, 16.f, 28.f, 45.f, 70.f};
+                        for (float r : radii)
+                            for (int k = 0; k < 8; ++k)
+                            {
+                                float const a = k * (6.2831853f / 8.f);
+                                consider(p.destX + std::cos(a) * r, p.destY + std::sin(a) * r, p.destZ);
+                            }
+
+                        if (found)
+                        {
+                            p.curTgtX = bx; p.curTgtY = by; p.curTgtZ = bz;
+                            p.curTgtSet = true;
+                            leader->GetMotionMaster()->MovePoint(990003, bx, by, bz,
+                                                                 FORCED_MOVEMENT_NONE, 0.f, 0.f, true, false);
+                        }
+                        else
+                        {
+                            p.curTgtSet = false;  // nothing reachable near the door -> let fallback disband
+                        }
+
+                        std::ostringstream o;
+                        o << "DESCEND move found=" << found << " endToDoor=" << (int)bestD
+                          << " doorDist3d=" << (int)doorDist3d << " z=" << (int)lz;
+                        F2Log(o.str());
+                    }
+                }
+                else
+                {
+                    // Cohesion is handled by snapping stragglers (in the follower loop above), NOT by
+                    // stopping the leader. The old StopMoving-when-strung-out made the leader
+                    // stop -> check-mount DISMOUNTS it -> followers catch up -> it remounts and pulls
+                    // away again: that stop/go IS the chop, and the mount flicker desynced everyone's
+                    // speed so followers never kept pace. Leader now glides one continuous spline; its
+                    // mount state stays stable so followers (which mirror the master's mount) hold pace.
+                    float const toTgt = p.curTgtSet ? leader->GetExactDist2d(p.curTgtX, p.curTgtY) : 1e9f;
+                    if (!leader->isMoving() || !p.curTgtSet || toTgt <= 12.f)
+                    {
+                        // Multi-probe: PathGenerator to the entrance, else probe directions/distances
+                        // toward it; take the first REAL navmesh path (NORMAL/INCOMPLETE, and none of
+                        // NOPATH/SHORTCUT/NOT_USING_PATH = straight line). Routes around walls, avoids
+                        // off-mesh/water targets. (No loadMapAndVMaps -- grid loads here deadlock.)
+                        p.waypoints.clear();
+                        PathType ptype = PATHFIND_BLANK;
+                        auto tryTarget = [&](float tgx, float tgy, float tgz) -> bool
+                        {
+                            PathGenerator g(leader);
+                            g.CalculatePath(tgx, tgy, tgz);
+                            ptype = g.GetPathType();
+                            if ((ptype & (PATHFIND_NORMAL | PATHFIND_INCOMPLETE)) == 0 ||
+                                (ptype & (PATHFIND_NOPATH | PATHFIND_SHORTCUT | PATHFIND_NOT_USING_PATH)) != 0 ||
+                                g.GetPath().size() <= 1)
+                                return false;
+                            for (G3D::Vector3 const& v : g.GetPath())
+                                p.waypoints.push_back(WorldLocation(leader->GetMapId(), v.x, v.y, v.z));
+                            return true;
+                        };
+
+                        bool usable = tryTarget(p.destX, p.destY, p.destZ);
+                        if (!usable)
+                        {
+                            float const baseAng = std::atan2(p.destY - ly, p.destX - lx);
+                            float const dists[] = {250.f, 150.f, 90.f};
+                            float const offs[] = {0.f, 0.4f, -0.4f, 0.8f, -0.8f};  // radians
+                            for (float d : dists)
+                            {
+                                for (float a : offs)
+                                {
+                                    float const ang = baseAng + a;
+                                    if (tryTarget(lx + std::cos(ang) * d, ly + std::sin(ang) * d, lz))
+                                    {
+                                        usable = true;
+                                        break;
+                                    }
+                                }
+                                if (usable)
+                                    break;
+                            }
+                        }
+
+                        if (usable)
+                        {
+                            // Aim at the FAR end of the path -> the core follows the whole reachable
+                            // navmesh route as one smooth spline (no per-waypoint stopping).
+                            WorldLocation const& endWp = p.waypoints.back();
+                            p.curTgtX = endWp.GetPositionX();
+                            p.curTgtY = endWp.GetPositionY();
+                            p.curTgtZ = endWp.GetPositionZ();
+                            p.curTgtSet = true;
+                            leader->GetMotionMaster()->MovePoint(990001, p.curTgtX, p.curTgtY, p.curTgtZ,
+                                                                 FORCED_MOVEMENT_NONE, 0.f, 0.f, true, false);
+                        }
+                        else
+                        {
+                            // Transient off-mesh/water: short 10-yd nudge toward the entrance.
+                            p.curTgtSet = false;
+                            float const dx = p.destX - lx, dy = p.destY - ly;
+                            float const flat = std::sqrt(dx * dx + dy * dy);
+                            float const step = std::min(10.0f, flat);
+                            float const nx = (flat > 1.0f) ? lx + dx / flat * step : p.destX;
+                            float const ny = (flat > 1.0f) ? ly + dy / flat * step : p.destY;
+                            leader->GetMotionMaster()->MovePoint(990001, nx, ny, lz, FORCED_MOVEMENT_NONE,
+                                                                 0.f, 0.f, true, false);
+                        }
+
+                        std::ostringstream o;
+                        o << "PATH type=" << (uint32)ptype << " usable=" << usable
+                          << " points=" << p.waypoints.size()
+                          << " remToWC=" << (int)leader->GetExactDist2d(p.destX, p.destY)
+                          << " flying=" << leader->IsFlying() << " mounted=" << leader->IsMounted()
+                          << " inWater=" << leader->IsInWater();
+                        F2Log(o.str());
+                    }
+                    // else: leader is mid-spline toward curTgt -> let it glide (smooth).
+                }
+            }
+
+            if (now - p.lastLogTime >= 15)
+            {
+                p.lastLogTime = now;
+                bool canMove = lAI->GetAiObjectContext()->GetValue<bool>("can move around")->Get();
+                std::ostringstream o;
+                o << "leader " << leader->GetName() << " zone " << leader->GetZoneId() << " pos ("
+                  << (int)leader->GetPositionX() << "," << (int)leader->GetPositionY() << ","
+                  << (int)leader->GetPositionZ() << ") dist "
+                  << (int)leader->GetExactDist(p.destX, p.destY, p.destZ)
+                  << " | travelStrat=" << lAI->HasStrategy("travel", BOT_STATE_NON_COMBAT)
+                  << " traveling=" << tt->isTraveling() << " forced=" << tt->isForced()
+                  << " moving=" << leader->isMoving()
+                  << " onTaxi=" << leader->HasUnitState(UNIT_STATE_IN_FLIGHT)
+                  << " canMove=" << canMove
+                  << " allowTravel=" << lAI->AllowActivity(TRAVEL_ACTIVITY, true)
+                  << " groupSpread=" << (int)p.maxMemberDist
+                  << " tgtDist=" << (int)(p.curTgtSet ? leader->GetExactDist2d(p.curTgtX, p.curTgtY) : -1);
+                F2Log(o.str());
+            }
+        }
+
+        if (done)
+        {
+            DisbandTravelParty(p);
+            it = _travelParties.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+void RandomPlayerbotMgr::DisbandTravelParty(TravelParty& p)
+{
+    Player* leader = ObjectAccessor::FindConnectedPlayer(p.leaderGuid);
+
+    // Clear the leader's forced travel target BEFORE freeing the destination it points at.
+    if (leader)
+    {
+        if (PlayerbotAI* leaderAI = GET_PLAYERBOT_AI(leader))
+        {
+            TravelTarget* target = leaderAI->GetAiObjectContext()->GetValue<TravelTarget*>("travel target")->Get();
+            target->setTarget(TravelMgr::instance().nullTravelDestination,
+                              TravelMgr::instance().nullWorldPosition);
+            leaderAI->ChangeStrategy("-travel", BOT_STATE_NON_COMBAT);
+        }
+    }
+
+    // Reset every member's AI so they drop follow/travel and resume normal behavior.
+    for (ObjectGuid const& guid : p.memberGuids)
+    {
+        Player* member = ObjectAccessor::FindConnectedPlayer(guid);
+        if (!member)
+            continue;
+        if (PlayerbotAI* memberAI = GET_PLAYERBOT_AI(member))
+        {
+            memberAI->SetMaster(nullptr);
+            memberAI->ResetStrategies();
+        }
+    }
+
+    // Disband the group (removes members + storage).
+    if (leader && leader->GetGroup())
+        leader->GetGroup()->Disband(true);
+
+    // Free the objects we own. The travel target no longer references them (cleared above,
+    // or the leader's AI is already gone).
+    delete p.dest;
+    delete p.destPos;
+    p.dest = nullptr;
+    p.destPos = nullptr;
+}
+
+bool RandomPlayerbotMgr::HandleTravelPartyCommand(ChatHandler* handler, char const* /*args*/)
+{
+    if (!sPlayerbotAIConfig.travelParties)
+    {
+        handler->PSendSysMessage("Travel parties are disabled (AiPlayerbot.TravelParties = 0).");
+        return true;
+    }
+
+    std::string leaderName = sRandomPlayerbotMgr.SpawnTravelParty();
+    if (!leaderName.empty())
+    {
+        std::string msg = "F2: travel party mustered at Orgrimmar, marching to Wailing Caverns. "
+                          "Group leader is " + leaderName + "  ->  .appear " + leaderName;
+        handler->SendSysMessage(msg.c_str());
+    }
+    else
+        handler->SendSysMessage("F2: could not form a travel party (no eligible bots or one is already active).");
+    return true;
+}
+
 void RandomPlayerbotMgr::RandomTeleportForLevel(Player* bot)
 {
     if (bot->InBattleground())
         return;
+
+    // Populate-Around-Players (F1): bias this teleport toward a real-player zone.
+    if (sPlayerbotAIConfig.populateAroundPlayers &&
+        urand(0, 100) < (uint32)(sPlayerbotAIConfig.populateProbTeleport * 100))
+    {
+        std::vector<WorldLocation> playerLocs = GetPlayerZoneTeleportLocations(bot);
+        if (!playerLocs.empty())
+        {
+            RandomTeleport(bot, playerLocs, false);
+            return;
+        }
+    }
 
     if (bot->GetLevel() >= 10 && urand(0, 100) < sPlayerbotAIConfig.probTeleToBankers * 100)
     {

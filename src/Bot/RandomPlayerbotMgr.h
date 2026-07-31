@@ -101,6 +101,11 @@ public:
 
     uint32 activeBots = 0;
     static bool HandlePlayerbotConsoleCommand(ChatHandler* handler, char const* args);
+    // F2 — Overland travel parties. Form one party (Phase 1: Orgrimmar -> Wailing Caverns) that
+    // marches on foot then disbands. Fired by the GM command and (in test mode) the coordinator timer.
+    std::string SpawnTravelParty();  // returns leader name on success, "" on failure
+    static bool HandleTravelPartyCommand(ChatHandler* handler, char const* args);
+    bool IsInTravelParty(Player* bot);  // public: also used to force-activate marching bots
     bool IsRandomBot(Player* bot);
     bool IsRandomBot(ObjectGuid::LowType bot);
     bool IsAddclassBot(Player* bot);
@@ -240,6 +245,63 @@ private:
     uint32 GetZoneLevel(uint16 mapId, float teleX, float teleY, float teleZ);
     typedef void (RandomPlayerbotMgr::*ConsoleCommandHandler)(Player*);
     std::vector<Player*> players;
+
+    // Populate-Around-Players (F1)
+    struct ZoneDemand
+    {
+        uint32 zoneId = 0;
+        uint32 target = 0;
+        float allianceShare = 0.5f;
+        bool allowAlliance = true;
+        bool allowHorde = true;
+        uint32 playersAlliance = 0;
+        uint32 playersHorde = 0;
+        uint32 minPlayerLevel = 0;
+        uint32 maxPlayerLevel = 0;
+        uint32 curAlliance = 0;
+        uint32 curHorde = 0;
+        uint32 curPeer = 0;
+        uint32 curTexture = 0;
+    };
+    std::unordered_map<uint32, ZoneDemand> _playerZones;
+    uint32 _playerZoneRefreshTime = 0;
+    void RefreshPlayerZones();
+    bool IsPopulatePeer(ZoneDemand const& demand, uint32 level) const;
+    std::vector<WorldLocation> GetPlayerZoneTeleportLocations(Player* bot);
+
+    // F2 — Overland travel parties
+    struct TravelParty
+    {
+        ObjectGuid leaderGuid;
+        std::vector<ObjectGuid> memberGuids;  // includes the leader
+        TravelDestination* dest = nullptr;    // self-owned; freed on disband
+        WorldPosition* destPos = nullptr;     // self-owned; freed on disband
+        uint32 mapId = 0;
+        float destX = 0.f, destY = 0.f, destZ = 0.f;
+        uint32 deadline = 0;    // unix time; disband when exceeded (crude anti-stuck watchdog)
+        uint32 lastLogTime = 0; // throttle for the progress log during the live walk test
+        float maxMemberDist = 0.f;  // farthest follower from leader (crew cohesion)
+        std::vector<WorldLocation> waypoints;  // current navmesh partial path toward the entrance
+        size_t wpIndex = 0;                    // next waypoint the leader is walking toward
+        // Smooth movement: aim MovePoint at the FAR end of the path for one long spline, and only
+        // re-issue when near it / stopped (re-issuing every tick resets the spline = choppy).
+        float curTgtX = 0.f, curTgtY = 0.f, curTgtZ = 0.f;
+        bool curTgtSet = false;
+        // Descend-to-door: the entrance sits in a ravine, so the navmesh path from the RIM to the
+        // door poly is only partial and the leader circles the rim. Track the best 3D distance to
+        // the real door; when it plateaus near the entrance, switch to a straight descent.
+        float bestDoorDist = 1e9f;
+        uint32 bestProgressTime = 0;  // last time bestDoorDist improved (init to spawn time)
+        bool descending = false;
+        // Multi-stage route (outdoor cave MOUTH -> inside PORTAL). destX/Y/Z is the CURRENT stage's
+        // target; advance on arrival, disband after the last. General for Phase 2 approach chains.
+        std::vector<WorldLocation> route;
+        size_t routeIdx = 0;
+    };
+    std::vector<TravelParty> _travelParties;
+    uint32 _travelPartyTime = 0;
+    void UpdateTravelParties();               // per-tick: check arrival/timeout, disband
+    void DisbandTravelParty(TravelParty& p);  // tear down group + AI, free owned dest
     uint32 processTicks;
 
     // std::map<uint32, std::vector<WorldLocation>> rpgLocsCache;

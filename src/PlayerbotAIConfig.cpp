@@ -145,6 +145,53 @@ bool PlayerbotAIConfig::Initialize()
     randomBotMapsAsString = sConfigMgr->GetOption<std::string>("AiPlayerbot.RandomBotMaps", "0,1,530,571");
     LoadList<std::vector<uint32>>(randomBotMapsAsString, randomBotMaps);
     probTeleToBankers = sConfigMgr->GetOption<float>("AiPlayerbot.ProbTeleToBankers", 0.25f);
+
+    // Populate-Around-Players (F1)
+    populateAroundPlayers = sConfigMgr->GetOption<bool>("AiPlayerbot.PopulateAroundPlayers", false);
+    populateProbTeleport = sConfigMgr->GetOption<float>("AiPlayerbot.PopulateProbTeleport", 0.4f);
+    populateDensityDefault = sConfigMgr->GetOption<uint32>("AiPlayerbot.PopulateDensityDefault", 25);
+    populatePeerBand = sConfigMgr->GetOption<uint32>("AiPlayerbot.PopulatePeerBand", 7);
+    populatePeerFraction = sConfigMgr->GetOption<float>("AiPlayerbot.PopulatePeerFraction", 0.7f);
+    populateSoloFactionRatio = sConfigMgr->GetOption<float>("AiPlayerbot.PopulateSoloFactionRatio", 0.7f);
+    populateMinorityFloor = sConfigMgr->GetOption<float>("AiPlayerbot.PopulateMinorityFloor", 0.35f);
+    populateSoftenEnemyPvp = sConfigMgr->GetOption<bool>("AiPlayerbot.PopulateSoftenEnemyPvp", true);
+    populateSoftenReactMult = sConfigMgr->GetOption<float>("AiPlayerbot.PopulateSoftenReactMult", 2.0f);
+    // F2 — Overland travel parties
+    travelParties = sConfigMgr->GetOption<bool>("AiPlayerbot.TravelParties", false);
+    travelPartyTestMode = sConfigMgr->GetOption<bool>("AiPlayerbot.TravelPartyTestMode", false);
+    travelPartyDungeonSize = sConfigMgr->GetOption<uint32>("AiPlayerbot.TravelPartyDungeonSize", 5);
+    {
+        std::vector<std::string> _starter;
+        LoadListString<std::vector<std::string>>(
+            sConfigMgr->GetOption<std::string>("AiPlayerbot.PopulateStarterZones", "1,12,14,85,141,215,3430,3524"), _starter);
+        populateStarterZones.clear();
+        for (std::string const& s : _starter)
+            populateStarterZones.push_back((uint32)atoi(s.c_str()));
+    }
+    {
+        std::vector<std::string> _sanct;
+        LoadListString<std::vector<std::string>>(
+            sConfigMgr->GetOption<std::string>("AiPlayerbot.PopulateSanctuaryZones", "1497,1519,1537,1637,1638,1657,3487,3557,3703,4395"), _sanct);
+        populateSanctuaryZones.clear();
+        for (std::string const& s : _sanct)
+            populateSanctuaryZones.push_back((uint32)atoi(s.c_str()));
+    }
+    {
+        std::vector<std::string> _over;
+        LoadListString<std::vector<std::string>>(
+            sConfigMgr->GetOption<std::string>("AiPlayerbot.PopulateDensityOverrides", "33:40,17:40,440:40,357:40,16:40,490:40"), _over);
+        populateDensityOverrides.clear();
+        for (std::string const& p : _over)
+        {
+            size_t c = p.find(':');
+            if (c == std::string::npos)
+                continue;
+            uint32 zid = (uint32)atoi(p.substr(0, c).c_str());
+            uint32 tgt = (uint32)atoi(p.substr(c + 1).c_str());
+            if (zid && tgt)
+                populateDensityOverrides[zid] = tgt;
+        }
+    }
     enableWeightTeleToCityBankers = sConfigMgr->GetOption<bool>("AiPlayerbot.EnableWeightTeleToCityBankers", false);
     weightTeleToStormwind = sConfigMgr->GetOption<int>("AiPlayerbot.TeleToStormwindWeight", 2);
     weightTeleToIronforge = sConfigMgr->GetOption<int>("AiPlayerbot.TeleToIronforgeWeight", 1);
