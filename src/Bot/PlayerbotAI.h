@@ -594,6 +594,7 @@ public:
     bool HasItemInInventory(uint32 itemId);
     std::vector<std::pair<const Quest*, uint32>> GetCurrentQuestsRequiringItemId(uint32 itemId);
     uint32 GetReactDelay();
+    bool IsSoftenedWorldPvp();  // Populate Phase 4: true when fighting a real player in open world
 
     std::vector<const Quest*> GetAllCurrentQuests();
     std::vector<const Quest*> GetCurrentIncompleteQuests();

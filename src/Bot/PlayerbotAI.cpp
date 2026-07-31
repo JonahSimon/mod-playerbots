@@ -4627,6 +4627,11 @@ bool PlayerbotAI::AllowActive(ActivityType activityType)
     if (bot->InBattlegroundQueue())
         return true;
 
+    // F2: bot is marching in an overland travel party — stay active so it actually walks,
+    // even with no real player nearby (party bots are grouped only with each other).
+    if (sPlayerbotAIConfig.travelParties && sRandomPlayerbotMgr.IsInTravelParty(bot))
+        return true;
+
     // bot is in a guild that contains a real player
     if (sPlayerbotAIConfig.BotActiveAloneForceWhenInGuild)
     {
@@ -6606,9 +6611,31 @@ std::set<uint32> PlayerbotAI::GetCurrentIncompleteQuestIds()
     return result;
 }
 
+// Populate Phase 4: a bot fighting a REAL human player in the open world reacts slower, so it
+// plays like an average player rather than a frame-perfect BiS bot. Structured PvP (BG/arena) and
+// bots serving a real master are unaffected.
+bool PlayerbotAI::IsSoftenedWorldPvp()
+{
+    if (HasRealPlayerMaster())
+        return false;
+    if (bot->InBattleground() || bot->InArena())
+        return false;
+
+    Unit* victim = bot->GetVictim();
+    if (!victim || !victim->IsPlayer())
+        return false;
+
+    PlayerbotAI* victimAI = GET_PLAYERBOT_AI(victim->ToPlayer());
+    return !victimAI || victimAI->IsRealPlayer();  // victim is a real human
+}
+
 uint32 PlayerbotAI::GetReactDelay()
 {
     uint32 base = sPlayerbotAIConfig.reactDelay;  // Default 100(ms)
+
+    // Populate Phase 4: soften reactions while fighting a real player in the open world.
+    if (sPlayerbotAIConfig.populateSoftenEnemyPvp && IsSoftenedWorldPvp())
+        base = static_cast<uint32>(base * sPlayerbotAIConfig.populateSoftenReactMult);
 
     // If dynamic react delay is disabled, use a static calculation
     if (!sPlayerbotAIConfig.dynamicReactDelay)
