@@ -1989,7 +1989,10 @@ std::vector<WorldLocation> RandomPlayerbotMgr::GetPlayerZoneTeleportLocations(Pl
 // drop once the walk is validated.
 static void F2Log(std::string const& line)
 {
-    std::ofstream f("C:/Build/bin/RelWithDebInfo/Logs/F2_travel.log", std::ios::app);
+    // Relative to the server's CWD, which is where every other log lands (LogsDir = "").
+    // Was hardcoded to C:/Build/bin/RelWithDebInfo/Logs/ from the Windows build: on Linux the
+    // open silently failed and ALL F2 telemetry was discarded, leaving only the 3 LOG_ERROR lines.
+    std::ofstream f("F2_travel.log", std::ios::app);
     if (f)
     {
         f << "[" << (uint32)time(nullptr) << "] " << line << "\n";
