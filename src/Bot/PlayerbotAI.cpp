@@ -6613,7 +6613,7 @@ std::set<uint32> PlayerbotAI::GetCurrentIncompleteQuestIds()
 // bots serving a real master are unaffected.
 bool PlayerbotAI::IsSoftenedWorldPvp()
 {
-    if (HasRealPlayerMaster())
+    if (HasGameClientMaster())
         return false;
     if (bot->InBattleground() || bot->InArena())
         return false;
@@ -6622,8 +6622,8 @@ bool PlayerbotAI::IsSoftenedWorldPvp()
     if (!victim || !victim->IsPlayer())
         return false;
 
-    PlayerbotAI* victimAI = GET_PLAYERBOT_AI(victim->ToPlayer());
-    return !victimAI || victimAI->IsRealPlayer();  // victim is a real human
+    Player* victimPlayer = victim->ToPlayer();
+    return IsRealPlayer(victimPlayer) || IsSelfBot(victimPlayer);  // victim is a human at a client
 }
 
 uint32 PlayerbotAI::GetReactDelay()
