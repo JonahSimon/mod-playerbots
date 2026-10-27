@@ -271,7 +271,7 @@ private:
         uint32 curPeer = 0;
         uint32 curTexture = 0;
     };
-    std::unordered_map<uint32, ZoneDemand> _playerZones;
+    std::unordered_map<uint32, ZoneDemand> _populateZoneDemand;
     uint32 _playerZoneRefreshTime = 0;
     void RefreshPlayerZones();
     bool IsPopulatePeer(ZoneDemand const& demand, uint32 level) const;

@@ -1879,7 +1879,7 @@ void RandomPlayerbotMgr::InitArenaTeams()
 
 void RandomPlayerbotMgr::RefreshPlayerZones()
 {
-    _playerZones.clear();
+    _populateZoneDemand.clear();
 
     // 1. Seed zones from online real players.
     for (Player* player : players)
@@ -1888,7 +1888,7 @@ void RandomPlayerbotMgr::RefreshPlayerZones()
             continue;
 
         uint32 zoneId = player->GetZoneId();
-        ZoneDemand& d = _playerZones[zoneId];
+        ZoneDemand& d = _populateZoneDemand[zoneId];
         d.zoneId = zoneId;
 
         uint32 level = player->GetLevel();
@@ -1901,11 +1901,11 @@ void RandomPlayerbotMgr::RefreshPlayerZones()
         d.maxPlayerLevel = std::max(d.maxPlayerLevel, level);
     }
 
-    if (_playerZones.empty())
+    if (_populateZoneDemand.empty())
         return;
 
     // 2. Density target + faction share per zone (territory-driven).
-    for (auto& itr : _playerZones)
+    for (auto& itr : _populateZoneDemand)
     {
         ZoneDemand& d = itr.second;
 
@@ -1978,8 +1978,8 @@ void RandomPlayerbotMgr::RefreshPlayerZones()
         if (!bot || !bot->IsInWorld())
             continue;
 
-        auto zi = _playerZones.find(bot->GetZoneId());
-        if (zi == _playerZones.end())
+        auto zi = _populateZoneDemand.find(bot->GetZoneId());
+        if (zi == _populateZoneDemand.end())
             continue;
 
         ZoneDemand& d = zi->second;
@@ -2006,7 +2006,7 @@ bool RandomPlayerbotMgr::IsPopulatePeer(ZoneDemand const& d, uint32 level) const
 std::vector<WorldLocation> RandomPlayerbotMgr::GetPlayerZoneTeleportLocations(Player* bot)
 {
     std::vector<WorldLocation> out;
-    if (!bot || _playerZones.empty())
+    if (!bot || _populateZoneDemand.empty())
         return out;
 
     std::vector<WorldLocation> locs = sTravelMgr.GetTeleportLocations(bot);
@@ -2023,8 +2023,8 @@ std::vector<WorldLocation> RandomPlayerbotMgr::GetPlayerZoneTeleportLocations(Pl
             continue;
 
         uint32 zoneId = map->GetZoneId(bot->GetPhaseMask(), loc.GetPositionX(), loc.GetPositionY(), loc.GetPositionZ());
-        auto zi = _playerZones.find(zoneId);
-        if (zi == _playerZones.end())
+        auto zi = _populateZoneDemand.find(zoneId);
+        if (zi == _populateZoneDemand.end())
             continue;
 
         ZoneDemand const& d = zi->second;
